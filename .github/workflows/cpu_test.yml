@@ -70,6 +70,7 @@ jobs:
         python -m torch.utils.collect_env
 
     - name: Install MMF
+      shell: bash -l {0}
       run: |
         conda activate mmf
         cd ${GITHUB_WORKSPACE}/mmf_master
@@ -77,6 +78,7 @@ jobs:
         python setup.py install
 
     - name: Run Unit Tests
+      shell: bash -l {0}
       run: |
         conda activate mmf
         cd ${GITHUB_WORKSPACE}/mmf_master/tests
