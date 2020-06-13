@@ -42,10 +42,11 @@ jobs:
       env:
         # Increase this value to reset cache if nothing has not changed but you still
         # want to invalidate the cache
-        CACHE_NUMBER: 1
+        CACHE_NUMBER: 2
       with:
         path: |
           /usr/share/miniconda/envs/
+          /usr/local/miniconda/envs/
         key: cpu-mmf-${{ matrix.platform }}-python${{ matrix.python-version }}-${{ env.CACHE_NUMBER }}-${{ hashFiles('**/requirements.txt') }}-${{ hashFiles('**/setup.py') }}
 
     - name: Install Dependencies
