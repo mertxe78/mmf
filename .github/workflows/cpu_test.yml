@@ -58,6 +58,7 @@ jobs:
         key: cpu-mmf-${{ matrix.platform }}-python${{ matrix.python-version }}-${{ env.CACHE_NUMBER }}-${{ hashFiles('**/requirements.txt') }}-${{ hashFiles('**/setup.py') }}
 
     - name: Install Dependencies
+      shell: bash -l {0}
       run: |
         conda activate mmf
         cd ${GITHUB_WORKSPACE}/mmf_master
