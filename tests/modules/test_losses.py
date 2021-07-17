@@ -3,11 +3,11 @@ import collections
 import unittest
 from unittest.mock import MagicMock
 
-import torch
-
 import mmf.modules.losses as losses
+import torch
 from mmf.common.registry import registry
 from mmf.common.sample import SampleList
+
 
 RETURN_VALUE = torch.tensor(1.0)
 
@@ -88,3 +88,43 @@ class TestModuleLosses(unittest.TestCase):
         predicted["scores"] = torch.rand((5, 10, 9491))
 
         self.assertAlmostEqual(caption_ce_loss(expected, predicted).item(), 9.2507, 4)
+
+    def test_in_batch_hinge(self):
+        in_batch_hinge_loss = losses.InBatchHinge(0.2, True)
+
+        sample_list_input = dict()
+        predicted = dict()
+
+        # Test when the image and text have the same embeddings
+        predicted["targets"] = torch.Tensor([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        predicted["scores"] = predicted["targets"]
+        self.assertEqual(in_batch_hinge_loss(sample_list_input, predicted).item(), 0.0)
+
+        # Test random initialized
+        torch.manual_seed(1234)
+        predicted["targets"] = torch.rand((5, 10))
+        predicted["scores"] = torch.rand((5, 10))
+
+        self.assertAlmostEqual(
+            in_batch_hinge_loss(sample_list_input, predicted).item(), 6.5529985, 4
+        )
+
+    def test_mse_loss(self):
+        mse_loss = losses.MSELoss()
+
+        # Test random tensor but the same targets and scores
+        torch.manual_seed(1234)
+        random_tensor = torch.rand((1, 768))
+        sample_list = {"targets": random_tensor}
+        model_output = {"scores": random_tensor}
+        self.assertEqual(mse_loss(sample_list, model_output).item(), 0.0)
+
+    def test_cosine_embedding_loss(self):
+        cos_emb_loss = losses.CosineEmbeddingLoss()
+
+        # Test random tensor but the same targets and scores
+        torch.manual_seed(1234)
+        random_tensor = torch.rand((1, 768))
+        sample_list = {"targets": random_tensor}
+        model_output = {"scores": random_tensor}
+        self.assertEqual(cos_emb_loss(sample_list, model_output).item(), 0.0)

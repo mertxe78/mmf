@@ -2,9 +2,8 @@
 import os
 import unittest
 
-import torch
-
 import mmf.modules.metrics as metrics
+import torch
 from mmf.common.registry import registry
 from mmf.common.sample import Sample
 from mmf.datasets.processors import CaptionProcessor
@@ -111,6 +110,41 @@ class TestModuleMetrics(unittest.TestCase):
         )
         self.assertAlmostEqual(metric.calculate(sample, predicted).item(), value, 4)
 
+    def _test_recall_at_k_metric(self, metric, value):
+        sample = Sample()
+        predicted = dict()
+
+        first_dimension = 10
+        second_dimension = 100  # second dim MUST be 100
+        sample.targets = torch.ones(first_dimension, second_dimension)
+        predicted["scores"] = torch.ones(first_dimension, second_dimension)
+
+        for i in range(first_dimension):
+            for j in range(second_dimension):
+                # sample = [[0, 1, 2, ..., 99], [0, 1, ..., 99], ...]
+                sample.targets[i][j] = j
+                if j == second_dimension - 1 and i != 0:
+                    # changes last value or 'chosen candidate'
+                    # to a lower rank as i increases
+                    # predicted = [[0, 2, 4, ..., 198], [0, 2, ..., 196, 191],
+                    # [0, ..., 196, 189], [0, ..., 196, 187], ...]
+                    predicted["scores"][i][j] = j * 2 - 1 - (i + 2) * 2
+                else:
+                    # predicted = [[0, 2, 4, ..., 198], [0, 2, ...], ...]
+                    predicted["scores"][i][j] = j * 2
+
+        self.assertAlmostEqual(metric.calculate(sample, predicted), value)
+
+    def _test_retrieval_recall_at_k_metric(self, metric, value):
+        sample = Sample()
+        predicted = dict()
+
+        torch.manual_seed(1234)
+        predicted["targets"] = torch.rand((10, 4))
+        predicted["scores"] = torch.rand((10, 4))
+
+        self.assertAlmostEqual(float(metric.calculate(sample, predicted)), value)
+
     def test_micro_f1(self):
         metric = metrics.MicroF1()
         self._test_binary_metric(metric, 0.5)
@@ -131,7 +165,7 @@ class TestModuleMetrics(unittest.TestCase):
 
     def test_multilabel_macro_f1(self):
         metric = metrics.MultiLabelMacroF1()
-        self._test_multilabel_metric(metric, 0.13333)
+        self._test_multilabel_metric(metric, 0.355555)
 
     def test_macro_roc_auc(self):
         metric = metrics.MacroROC_AUC()
@@ -143,12 +177,115 @@ class TestModuleMetrics(unittest.TestCase):
         self._test_binary_metric(metric, 0.5)
         self._test_multiclass_metric(metric, 0.34375)
 
+    def test_binary_ap(self):
+        metric = metrics.BinaryAP()
+        self._test_binary_metric(metric, 0.75)
+
+    def test_recall_at_precision_k(self):
+        metric = metrics.RecallAtPrecisionK(50)
+        self._test_binary_metric(metric, 1.0)
+
+        metric = metrics.RecallAtPrecisionK(90)
+        self._test_binary_metric(metric, 0.5)
+
+        metric = metrics.RecallAtPrecisionK(110)
+        self._test_binary_metric(metric, 0)
+
     def test_micro_ap(self):
         metric = metrics.MicroAP()
-        self._test_binary_metric(metric, 0.5)
-        self._test_multiclass_metric(metric, 0.34375)
+        self._test_binary_metric(metric, 0.642857)
+        self._test_multiclass_metric(metric, 0.354166)
 
     def test_macro_ap(self):
         metric = metrics.MacroAP()
-        self._test_binary_metric(metric, 0.5)
-        self._test_multiclass_metric(metric, 0.2222)
+        self._test_binary_metric(metric, 0.6666666)
+        self._test_multiclass_metric(metric, 0.3888888)
+
+    def test_recall_at_1(self):
+        metric = metrics.RecallAt1()
+        self._test_recall_at_k_metric(metric, 0.1)
+
+    def test_recall_at_5(self):
+        metric = metrics.RecallAt5()
+        self._test_recall_at_k_metric(metric, 0.3)
+
+    def test_recall_at_10(self):
+        metric = metrics.RecallAt10()
+        self._test_recall_at_k_metric(metric, 0.8)
+
+    def test_retrieval_recall_at_1(self):
+        metric = metrics.RecallAt1_ret()
+        self._test_retrieval_recall_at_k_metric(metric, 0.1)
+
+    def test_retrieval_recall_at_5(self):
+        metric = metrics.RecallAt5_ret()
+        self._test_retrieval_recall_at_k_metric(metric, 0.4)
+
+    def test_retrieval_recall_at_10(self):
+        metric = metrics.RecallAt10_ret()
+        self._test_retrieval_recall_at_k_metric(metric, 1.0)
+
+    def test_accuracy_base(self):
+        metric = metrics.Accuracy()
+
+        torch.manual_seed(2)
+        targets = torch.rand((25, 10))
+        scores = torch.rand((25, 10))
+
+        acc = metric.calculate({"targets": targets}, {"scores": scores})
+        self.assertAlmostEqual(0.04, acc.item())
+
+    def test_accuracy_base2(self):
+        metric = metrics.Accuracy()
+
+        torch.manual_seed(2)
+        targets = torch.rand((25, 10))
+        scores = torch.rand((25, 10))
+        scores = torch.max(scores, 1)[1]
+
+        acc = metric.calculate({"targets": targets}, {"scores": scores})
+        self.assertAlmostEqual(0.04, acc.item())
+
+    def test_accuracy_base3(self):
+        metric = metrics.Accuracy()
+
+        torch.manual_seed(2)
+        targets = torch.rand((25, 10))
+        targets = torch.max(targets, 1)[1]
+        scores = torch.rand((25, 10))
+
+        acc = metric.calculate({"targets": targets}, {"scores": scores})
+        self.assertAlmostEqual(0.04, acc.item())
+
+    def test_accuracy_top1(self):
+        metric = metrics.TopKAccuracy(score_key="scores", k=1)
+
+        torch.manual_seed(2)
+        targets = torch.rand((25, 10))
+        scores = torch.rand((25, 10))
+        targets = targets.topk(1, 1, True, True)[1].t().squeeze()
+
+        acc = metric.calculate({"targets": targets}, {"scores": scores})
+        self.assertAlmostEqual(0.04, acc.item(), 1)
+
+    def test_accuracy_top1_with_max(self):
+        metric = metrics.TopKAccuracy(score_key="scores", k=1)
+
+        torch.manual_seed(2)
+        targets = torch.rand((25, 10))
+        targets = torch.max(targets, 1)[1]
+        scores = torch.rand((25, 10))
+
+        acc = metric.calculate({"targets": targets}, {"scores": scores})
+        self.assertAlmostEqual(0.04, acc.item(), 1)
+
+    def test_accuracy_top5(self):
+        metric = metrics.TopKAccuracy(score_key="scores", k=5)
+
+        torch.manual_seed(2)
+        targets = torch.rand((25, 10))
+        targets = torch.max(targets, 1)[1]
+        scores = torch.rand((25, 10))
+
+        acc = metric.calculate({"targets": targets}, {"scores": scores})
+        self.assertAlmostEqual(0.48, acc.item(), 1)

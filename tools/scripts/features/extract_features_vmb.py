@@ -1,7 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 
-# Requires vqa-maskrcnn-benchmark to be built and installed
-# Category mapping for visual genome can be downloaded from
+# Requires vqa-maskrcnn-benchmark (https://gitlab.com/vedanuj/vqa-maskrcnn-benchmark)
+# to be built and installed. Category mapping for visual genome can be downloaded from
 # https://dl.fbaipublicfiles.com/pythia/data/visual_genome_categories.json
 # When the --background flag is set, the index saved with key "objects" in
 # info_list will be +1 of the Visual Genome category mapping above and 0
@@ -9,7 +9,6 @@
 # index saved with key "objects" in info list will match the Visual Genome
 # category mapping.
 import argparse
-import glob
 import os
 
 import cv2
@@ -20,39 +19,62 @@ from maskrcnn_benchmark.layers import nms
 from maskrcnn_benchmark.modeling.detector import build_detection_model
 from maskrcnn_benchmark.structures.image_list import to_image_list
 from maskrcnn_benchmark.utils.model_serialization import load_state_dict
+from mmf.utils.download import download
 from PIL import Image
 
-from mmf.utils.download import download
+from tools.scripts.features.extraction_utils import chunks, get_image_files
 
 
 class FeatureExtractor:
-    MODEL_URL = (
-        "https://dl.fbaipublicfiles.com/pythia/detectron_model/detectron_model.pth"
-    )
-    CONFIG_URL = (
-        "https://dl.fbaipublicfiles.com/pythia/detectron_model/detectron_model.yaml"
-    )
+
+    MODEL_URL = {
+        "X-101": "https://dl.fbaipublicfiles.com/pythia/"
+        + "detectron_model/detectron_model.pth",
+        "X-152": "https://dl.fbaipublicfiles.com/pythia/"
+        + "detectron_model/detectron_model_x152.pth",
+    }
+    CONFIG_URL = {
+        "X-101": "https://dl.fbaipublicfiles.com/pythia/"
+        + "detectron_model/detectron_model.yaml",
+        "X-152": "https://dl.fbaipublicfiles.com/pythia/"
+        + "detectron_model/detectron_model_x152.yaml",
+    }
+
     MAX_SIZE = 1333
     MIN_SIZE = 800
 
     def __init__(self):
         self.args = self.get_parser().parse_args()
+        self._try_downloading_necessities(self.args.model_name)
         self.detection_model = self._build_detection_model()
 
         os.makedirs(self.args.output_folder, exist_ok=True)
 
-    def _try_downloading_necessities(self):
-        if self.args.model_file is None:
+    def _try_downloading_necessities(self, model_name):
+        if self.args.model_file is None and model_name is not None:
+            model_url = self.MODEL_URL[model_name]
+            config_url = self.CONFIG_URL[model_name]
+            self.args.model_file = model_url.split("/")[-1]
+            self.args.config_file = config_url.split("/")[-1]
+            if os.path.exists(self.args.model_file) and os.path.exists(
+                self.args.config_file
+            ):
+                print(f"model and config file exists in directory: {os.getcwd()}")
+                return
             print("Downloading model and configuration")
-            self.args.model_file = self.MODEL_URL.split("/")[-1]
-            self.args.config_file = self.CONFIG_URL.split("/")[-1]
-            download(self.MODEL_URL, ".", self.args.model_file)
-            download(self.CONFIG_URL, ".", self.args.config_file)
+            download(model_url, ".", self.args.model_file)
+            download(config_url, ".", self.args.config_file)
 
     def get_parser(self):
         parser = argparse.ArgumentParser()
         parser.add_argument(
-            "--model_file", default=None, type=str, help="Detectron model file"
+            "--model_name", default="X-152", type=str, help="Model to use for detection"
+        )
+        parser.add_argument(
+            "--model_file",
+            default=None,
+            type=str,
+            help="Detectron model file. This overrides the model_name param.",
         )
         parser.add_argument(
             "--config_file", default=None, type=str, help="Detectron config file"
@@ -229,10 +251,6 @@ class FeatureExtractor:
 
         return feat_list
 
-    def _chunks(self, array, chunk_size):
-        for i in range(0, len(array), chunk_size):
-            yield array[i : i + chunk_size]
-
     def _save_feature(self, file_name, feature, info):
         file_base_name = os.path.basename(file_name)
         file_base_name = file_base_name.split(".")[0]
@@ -246,49 +264,23 @@ class FeatureExtractor:
 
     def extract_features(self):
         image_dir = self.args.image_dir
-
         if os.path.isfile(image_dir):
             features, infos = self.get_detectron_features([image_dir])
             self._save_feature(image_dir, features[0], infos[0])
         else:
-            files = glob.glob(os.path.join(image_dir, "*.png"))
-            files.extend(glob.glob(os.path.join(image_dir, "*.jpg")))
-            files.extend(glob.glob(os.path.join(image_dir, "*.jpeg")))
-            files = {f: 1 for f in files}
-            exclude = {}
 
-            if os.path.exists(self.args.exclude_list):
-                with open(self.args.exclude_list) as f:
-                    lines = f.readlines()
-                    for line in lines:
-                        exclude[
-                            line.strip("\n").split(os.path.sep)[-1].split(".")[0]
-                        ] = 1
-            output_files = glob.glob(os.path.join(self.args.output_folder, "*.npy"))
-            output_dict = {}
-            for f in output_files:
-                file_name = f.split(os.path.sep)[-1].split(".")[0]
-                output_dict[file_name] = 1
-
-            for f in list(files.keys()):
-                file_name = f.split(os.path.sep)[-1].split(".")[0]
-                if file_name in output_dict or file_name in exclude:
-                    files.pop(f)
-
-            files = list(files.keys())
+            files = get_image_files(
+                self.args.image_dir,
+                exclude_list=self.args.exclude_list,
+                start_index=self.args.start_index,
+                end_index=self.args.end_index,
+                output_folder=self.args.output_folder,
+            )
 
             finished = 0
+            total = len(files)
 
-            end_index = self.args.end_index
-            if end_index is None:
-                end_index = len(files)
-            start_index = self.args.start_index
-
-            total = len(files[start_index:end_index])
-
-            for chunk in self._chunks(
-                files[start_index:end_index], self.args.batch_size
-            ):
+            for chunk, begin_idx in chunks(files, self.args.batch_size):
                 features, infos = self.get_detectron_features(chunk)
                 for idx, file_name in enumerate(chunk):
                     self._save_feature(file_name, features[idx], infos[idx])

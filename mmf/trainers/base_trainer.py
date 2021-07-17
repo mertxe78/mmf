@@ -2,15 +2,18 @@
 
 from abc import ABC, abstractmethod
 
-from mmf.common import typings as mmf_typings
 from mmf.common.registry import registry
+from mmf.utils.logger import log_class_usage
+from omegaconf import DictConfig
 
 
 @registry.register_trainer("base")
 class BaseTrainer(ABC):
-    def __init__(self, config: mmf_typings.DictConfig):
+    def __init__(self, config: DictConfig):
         self.config = config
         self.training_config = self.config.training
+
+        log_class_usage("Trainer", self.__class__)
 
     def load(self):
         # Set run type

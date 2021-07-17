@@ -1,8 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+import collections
 from copy import deepcopy
 
 import torch
-
 from mmf.common.registry import registry
 from mmf.models.base_model import BaseModel
 from mmf.modules.encoders import MultiModalEncoderBase
@@ -43,8 +43,9 @@ class FusionBase(MultiModalEncoderBase):
             modal_kwargs = {}
         text = self.text(text, *text_args, **text_kwargs)
 
-        # Case of bert encoder, we only need pooled output
-        if len(text) == 2:
+        # Case of bert encoder, we only need pooled output. For BertModelJIT encoder
+        # pooled output is the 2nd in the tuple(sequence, pooled, encoded_layers)
+        if isinstance(text, collections.abc.Sequence) and len(text) >= 2:
             text = text[1]
 
         modal = self.modal(modal, *modal_args, **modal_kwargs)
@@ -86,8 +87,8 @@ class ConcatBERT(BaseModel):
     def get_optimizer_parameters(self, config):
         # For finetuning setup, we have classifier
         lr = config.optimizer.params.lr
-        model_config = getattr(config.model_config, config.model, {})
-        finetune_lr_multiplier = getattr(model_config, "finetune_lr_multiplier", 1)
+        model_config = config.model_config.get(config.model, {})
+        finetune_lr_multiplier = model_config.get("finetune_lr_multiplier", 1)
         # Finetune the bert pretrained part with finetune_lr_multiplier if it is set
         parameters = get_bert_configured_parameters(
             self.base, lr * finetune_lr_multiplier
@@ -101,7 +102,7 @@ class ConcatBERT(BaseModel):
         segment = sample_list.segment_ids
 
         if self._is_direct_features_input:
-            modal = sample_list.image_features_0
+            modal = sample_list.image_feature_0
         else:
             modal = sample_list.image
 

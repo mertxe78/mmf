@@ -1,9 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 import copy
 
+import omegaconf
 import torch
-from torch import nn
-
 from mmf.common.registry import registry
 from mmf.models.base_model import BaseModel
 from mmf.modules.embeddings import (
@@ -12,8 +11,9 @@ from mmf.modules.embeddings import (
     PreExtractedEmbedding,
     TextEmbedding,
 )
-from mmf.modules.encoders import ImageFeatureEncoder
 from mmf.modules.layers import ClassifierLayer, ModalCombineLayer
+from mmf.utils.build import build_image_encoder
+from torch import nn
 
 
 @registry.register_model("pythia")
@@ -81,14 +81,11 @@ class Pythia(BaseModel):
         setattr(self, attr + "_feature_dim", feature_dim)
 
         for feat_encoder in feat_encoders_list_config:
-            encoder_type = feat_encoder.type
-            encoder_kwargs = copy.deepcopy(feat_encoder.params)
-            encoder_kwargs.model_data_dir = self.config.model_data_dir
-
-            feat_model = ImageFeatureEncoder(
-                encoder_type, feature_dim, **encoder_kwargs
-            )
-
+            feat_encoder_config = copy.deepcopy(feat_encoder)
+            with omegaconf.open_dict(feat_encoder_config):
+                feat_encoder_config.params.model_data_dir = self.config.model_data_dir
+                feat_encoder_config.params.in_dim = feature_dim
+            feat_model = build_image_encoder(feat_encoder_config, direct_features=True)
             feat_encoders.append(feat_model)
             setattr(self, attr + "_feature_dim", feat_model.out_dim)
 
@@ -389,10 +386,9 @@ class PythiaMultiHead(Pythia):
         feat_dim = getattr(self, attr + "_feature_dim")
 
         for feat_encoder in feat_encoders_list_config:
-            encoder_type = feat_encoder.type
-            encoder_kwargs = feat_encoder.params
-
-            feat_model = ImageFeatureEncoder(encoder_type, feat_dim, **encoder_kwargs)
+            feat_encoder_config = copy.deepcopy(feat_encoder)
+            feat_encoder_config.params.in_dim = feat_dim
+            feat_model = build_image_encoder(feat_encoder_config, direct_features=True)
 
             feature_projectors.append(feat_model)
             setattr(self, attr + "_feature_dim", feat_model.out_dim)

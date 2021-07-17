@@ -12,8 +12,9 @@ attributes from ``Sample`` while taking care of properly batching things.
 """
 
 import collections
+import warnings
 from collections import OrderedDict
-from typing import Any, Dict
+from typing import Any, Dict, Union
 
 import torch
 
@@ -176,6 +177,13 @@ class SampleList(OrderedDict):
 
         return sample
 
+    def get_device(self):
+        field_tensor = self._get_tensor_field()
+        assert (
+            field_tensor is not None
+        ), f"No tensor field in sample list, available keys: {self.fields()}"
+        return self[field_tensor].device
+
     def get_item_list(self, key):
         """Get ``SampleList`` of only one particular attribute that is present
         in the ``SampleList``.
@@ -267,15 +275,8 @@ class SampleList(OrderedDict):
 
     def get_batch_size(self):
         """Get batch size of the current ``SampleList``. There must be a tensor
-
-    def __getitem__(self, key):
-        return self.__dict__[key]
-        field present in the ``SampleList`` currently.
-
+        be a tensor present inside sample list to use this function.
         Returns:
-
-    def __getitem__(self, key):
-        return self.__dict__[key]
             int: Size of the batch in ``SampleList``.
 
         """
@@ -365,6 +366,14 @@ class SampleList(OrderedDict):
 
         return self
 
+    def detach(self):
+        fields = self.keys()
+
+        for field in fields:
+            self[field] = detach_tensor(self[field])
+
+        return self
+
     def to_dict(self) -> Dict[str, Any]:
         """Converts a sample list to dict, this is useful for TorchScript and for
         other internal API unification efforts.
@@ -383,3 +392,77 @@ class SampleList(OrderedDict):
                 sample_dict[field] = self[field]
 
         return sample_dict
+
+
+def convert_batch_to_sample_list(
+    batch: Union[SampleList, Dict[str, Any]]
+) -> SampleList:
+    # Create and return sample list with proper name
+    # and type set if it is already not a sample list
+    # (case of batched iterators)
+    sample_list = batch
+    if (
+        # Check if batch is a list before checking batch[0]
+        # or len as sometimes batch is already SampleList
+        isinstance(batch, list)
+        and len(batch) == 1
+        and isinstance(batch[0], SampleList)
+    ):
+        sample_list = batch[0]
+    elif not isinstance(batch, SampleList):
+        sample_list = SampleList(batch)
+
+    if sample_list._get_tensor_field() is None:
+        sample_list = SampleList(sample_list.to_dict())
+
+    return sample_list
+
+
+device_type = Union[str, torch.device]
+
+
+def to_device(
+    sample_list: Union[SampleList, Dict[str, Any]], device: device_type = "cuda"
+) -> SampleList:
+    if isinstance(sample_list, collections.Mapping):
+        sample_list = convert_batch_to_sample_list(sample_list)
+    # to_device is specifically for SampleList
+    # if user is passing something custom built
+    if not isinstance(sample_list, SampleList):
+        warnings.warn(
+            "You are not returning SampleList/Sample from your dataset. "
+            "MMF expects you to move your tensors to cuda yourself."
+        )
+        return sample_list
+
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # default value of device_type is cuda
+    # Other device types such as xla can also be passed.
+    # Fall back to cpu only happens when device_type
+    # is set to cuda but cuda is not available.
+    if device.type == "cuda" and not torch.cuda.is_available():
+        warnings.warn(
+            "Selected device is cuda, but it is NOT available!!! Falling back on cpu."
+        )
+        device = torch.device("cpu")
+
+    if sample_list.get_device() != device:
+        sample_list = sample_list.to(device)
+    return sample_list
+
+
+def detach_tensor(tensor: Any) -> Any:
+    """Detaches any element passed which has a `.detach` function defined.
+    Currently, in MMF can be SampleList, Report or a tensor.
+
+    Args:
+        tensor (Any): Item to be detached
+
+    Returns:
+        Any: Detached element
+    """
+    if hasattr(tensor, "detach"):
+        tensor = tensor.detach()
+    return tensor

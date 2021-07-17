@@ -6,18 +6,18 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Any, Dict, Union
 
-from termcolor import colored
-
+import torch
 from mmf.common.registry import registry
 from mmf.utils.configuration import get_mmf_env
-from mmf.utils.distributed import get_rank, is_master
+from mmf.utils.distributed import get_rank, is_master, is_xla
 from mmf.utils.file_io import PathManager
 from mmf.utils.timer import Timer
+from termcolor import colored
 
 
-@functools.lru_cache()
 def setup_output_folder(folder_only: bool = False):
     """Sets up and returns the output file where the logs will be placed
     based on the configuration passed. Usually "save_dir/logs/log_<timestamp>.txt".
@@ -53,8 +53,6 @@ def setup_output_folder(folder_only: bool = False):
     return log_filename
 
 
-# so that calling setup_logger multiple times won't add many handlers
-@functools.lru_cache()
 def setup_logger(
     output: str = None,
     color: bool = True,
@@ -100,10 +98,16 @@ def setup_logger(
     distributed_rank = get_rank()
     handlers = []
 
+    config = registry.get("config")
+    if config:
+        logging_level = config.get("training", {}).get("logger_level", "info").upper()
+    else:
+        logging_level = logging.INFO
+
     if distributed_rank == 0:
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging_level)
         ch = logging.StreamHandler(stream=sys.stdout)
-        ch.setLevel(logging.INFO)
+        ch.setLevel(logging_level)
         if color:
             formatter = ColorfulFormatter(
                 colored("%(asctime)s | %(name)s: ", "green") + "%(message)s",
@@ -130,7 +134,7 @@ def setup_logger(
         PathManager.mkdirs(os.path.dirname(filename))
 
         fh = logging.StreamHandler(_cached_log_stream(filename))
-        fh.setLevel(logging.INFO)
+        fh.setLevel(logging_level)
         fh.setFormatter(plain_formatter)
         logger.addHandler(fh)
         warnings_logger.addHandler(fh)
@@ -141,7 +145,7 @@ def setup_logger(
             save_dir = get_mmf_env(key="save_dir")
             filename = os.path.join(save_dir, "train.log")
             sh = logging.StreamHandler(_cached_log_stream(filename))
-            sh.setLevel(logging.INFO)
+            sh.setLevel(logging_level)
             sh.setFormatter(plain_formatter)
             logger.addHandler(sh)
             warnings_logger.addHandler(sh)
@@ -154,7 +158,7 @@ def setup_logger(
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
     # Now, add our handlers.
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
+    logging.basicConfig(level=logging_level, handlers=handlers)
 
     registry.register("writer", logger)
 
@@ -205,6 +209,59 @@ def _find_caller():
         frame = frame.f_back
 
 
+def summarize_report(
+    current_iteration,
+    num_updates,
+    max_updates,
+    meter,
+    should_print=True,
+    extra=None,
+    tb_writer=None,
+):
+    if extra is None:
+        extra = {}
+    if not is_master() and not is_xla():
+        return
+
+    if tb_writer:
+        scalar_dict = meter.get_scalar_dict()
+        tb_writer.add_scalars(scalar_dict, current_iteration)
+
+    if not should_print:
+        return
+    log_dict = {}
+    if num_updates is not None and max_updates is not None:
+        log_dict.update({"progress": f"{num_updates}/{max_updates}"})
+
+    log_dict.update(meter.get_log_dict())
+    log_dict.update(extra)
+
+    log_progress(log_dict)
+
+
+def calculate_time_left(
+    max_updates,
+    num_updates,
+    timer,
+    num_snapshot_iterations,
+    log_interval,
+    eval_interval,
+):
+    if num_updates is None or max_updates is None:
+        return "Unknown"
+
+    time_taken_for_log = time.time() * 1000 - timer.start
+    iterations_left = max_updates - num_updates
+    num_logs_left = iterations_left / log_interval
+    time_left = num_logs_left * time_taken_for_log
+
+    snapshot_iteration = num_snapshot_iterations / log_interval
+    snapshot_iteration *= iterations_left / eval_interval
+    time_left += snapshot_iteration * time_taken_for_log
+
+    return timer.get_time_hhmmss(gap=time_left)
+
+
 def log_progress(info: Union[Dict, Any], log_format="simple"):
     """Useful for logging progress dict.
 
@@ -234,6 +291,14 @@ def log_progress(info: Union[Dict, Any], log_format="simple"):
         output = str(info)
 
     logger.info(output)
+
+
+def log_class_usage(component_type, klass):
+    """This function is used to log the usage of different MMF components."""
+    identifier = "MMF"
+    if klass and hasattr(klass, "__name__"):
+        identifier += f".{component_type}.{klass.__name__}"
+    torch._C._log_api_usage_once(identifier)
 
 
 # ColorfulFormatter is adopted from Detectron2 and adapted for MMF

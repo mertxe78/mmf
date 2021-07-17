@@ -1,21 +1,19 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 
 import torch
+from mmf.common.registry import registry
+from mmf.models.pythia import Pythia
+from mmf.modules.embeddings import ProjectionEmbedding
+from mmf.utils.transform import transform_to_batch_sequence
 from torch import nn
 from transformers.modeling_bert import (
     BertConfig,
     BertEmbeddings,
     BertForPreTraining,
-    BertLayerNorm,
     BertPooler,
     BertPredictionHeadTransform,
     BertPreTrainingHeads,
 )
-
-from mmf.common.registry import registry
-from mmf.models.pythia import Pythia
-from mmf.modules.embeddings import ProjectionEmbedding
-from mmf.utils.transform import transform_to_batch_sequence
 
 
 @registry.register_model("mmf_bert")
@@ -31,7 +29,7 @@ class MMFBert(Pythia):
         super().build()
         self.tie_weights()
 
-        if getattr(self.config, "freeze_base", False):
+        if self.config.get("freeze_base", False):
             for n, p in self.named_parameters():
                 if "classifier" not in n:
                     p.requires_grad = False
@@ -82,7 +80,7 @@ class MMFBert(Pythia):
         self.text_embedding = nn.MultiheadAttention(**self.config.text_embeddings[0])
 
     def _tie_or_clone_weights(self, first_module, second_module):
-        """ Tie or clone module weights depending of weither we are using
+        """Tie or clone module weights depending of weither we are using
         TorchScript or not
         """
         if self.config.torchscript:
@@ -91,9 +89,9 @@ class MMFBert(Pythia):
             first_module.weight = second_module.weight
 
     def tie_weights(self):
-        """ Make sure we are sharing the input and output embeddings.
-            Export to TorchScript can't handle parameter sharing so we are cloning
-            them instead.
+        """Make sure we are sharing the input and output embeddings.
+        Export to TorchScript can't handle parameter sharing so we are cloning
+        them instead.
         """
         if hasattr(self, "cls"):
             self._tie_or_clone_weights(
@@ -102,7 +100,7 @@ class MMFBert(Pythia):
 
     def _init_feature_embeddings(self, attr):
         feature_embeddings_list = []
-        num_feature_feat = len(getattr(self.config, f"{attr}_feature_encodings"))
+        num_feature_feat = len(self.config.get(f"{attr}_feature_encodings"))
 
         self.image_feature_projection = ProjectionEmbedding(
             **self.config.image_feature_projection
@@ -272,14 +270,13 @@ class MMFBert(Pythia):
         return feature_embedding_total, feature_attentions
 
     def init_weights(self, module):
-        """ Initialize the weights.
-        """
+        """Initialize the weights."""
         if isinstance(module, (nn.Linear, nn.Embedding)):
             # Slightly different from the TF version which uses truncated_normal
             # for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.bert_config.initializer_range)
-        elif isinstance(module, BertLayerNorm):
+        elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
         if isinstance(module, nn.Linear) and module.bias is not None:

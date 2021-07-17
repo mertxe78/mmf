@@ -8,6 +8,7 @@ model_config:
     freeze_modal: false
     freeze_complete_base: false
     finetune_lr_multiplier: 1
+    fused_feature_only: false
     # Dimension of the embedding finally returned by the modal encoder
     modal_hidden_size: 2048
     # Dimension of the embedding finally returned by the text encoder
@@ -26,6 +27,7 @@ model_config:
     text_encoder:
       type: transformer
       params:
+        num_segments: 2
         bert_model_name: ${model_config.mmbt.bert_model_name}
         # Options below can be overridden to update the bert configuration used
         # to initialize the bert encoder. If some option is missing or

@@ -1,7 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 
 import torch
-
 from mmf.common.registry import registry
 from mmf.models.pythia import Pythia
 from mmf.modules.layers import ClassifierLayer
@@ -156,8 +155,25 @@ class BUTD(Pythia):
             else:
                 scores[:batch_size_t, t] = output
 
-        model_output = {"scores": scores}
+        model_output = {}
         if self.config.inference.type in ["beam_search", "nucleus_sampling"]:
-            model_output["captions"] = decoder.get_result()
+            results = decoder.get_result()
+            results = torch.nn.functional.pad(
+                results,
+                (0, self.text_processor.max_length - results.size()[-1]),
+                "constant",
+                0,
+            )
+            model_output["captions"] = results
+            model_output["losses"] = {}
+            loss_key = "{}/{}".format(
+                sample_list.dataset_name, sample_list.dataset_type
+            )
+            # Add a dummy loss so that loss calculation is not required
+            model_output["losses"][loss_key + "/dummy_loss"] = torch.zeros(
+                batch_size, device=sample_list.answers.device
+            )
+        else:
+            model_output["scores"] = scores
 
         return model_output

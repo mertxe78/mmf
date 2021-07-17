@@ -66,6 +66,7 @@ Example::
             return {"text": text}
 """
 
+import collections
 import copy
 import logging
 import os
@@ -74,18 +75,20 @@ import re
 import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import torch
-
 from mmf.common.registry import registry
 from mmf.common.typings import ProcessorConfigType
 from mmf.utils.configuration import get_mmf_cache_dir, get_mmf_env
 from mmf.utils.distributed import is_master, synchronize
 from mmf.utils.file_io import PathManager
+from mmf.utils.logger import log_class_usage
 from mmf.utils.text import VocabDict
 from mmf.utils.vocab import Vocab, WordToVectorDict
+from omegaconf import DictConfig
+
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +108,9 @@ class BaseProcessor:
 
     """
 
-    def __init__(self, config: Dict[str, Any], *args, **kwargs):
+    def __init__(self, *args, config: Optional[DictConfig] = None, **kwargs):
+
+        log_class_usage("Processor", self.__class__)
         return
 
     def __call__(self, item: Any, *args, **kwargs) -> Any:
@@ -136,7 +141,7 @@ class Processor:
     """
 
     def __init__(self, config: ProcessorConfigType, *args, **kwargs):
-        if not hasattr(config, "type"):
+        if "type" not in config:
             raise AttributeError(
                 "Config must have 'type' attribute to specify type of processor"
             )
@@ -144,7 +149,7 @@ class Processor:
         processor_class = registry.get_processor_class(config.type)
 
         params = {}
-        if not hasattr(config, "params"):
+        if "params" not in config:
             logger.warning(
                 "Config doesn't have 'params' attribute to "
                 "specify parameters of the processor "
@@ -166,7 +171,7 @@ class Processor:
         elif "processor" in self.__dict__ and hasattr(self.processor, name):
             return getattr(self.processor, name)
         else:
-            raise AttributeError(name)
+            raise AttributeError(f"The processor {name} doesn't exist in the registry.")
 
 
 class BatchProcessor(BaseProcessor):
@@ -187,7 +192,7 @@ class BatchProcessor(BaseProcessor):
         processors_dict = config.get("processors", {})
 
         # Since build_processors also imports processor, import it at runtime to
-        # avoid circulat dependencies
+        # avoid circular dependencies
         from mmf.utils.build import build_processors
 
         self.processors = build_processors(processors_dict, **extra_params)
@@ -374,9 +379,17 @@ class GloVeProcessor(VocabProcessor):
 
             vocab_processor_config.vocab.type = "pretrained"
 
-        super().__init__(vocab_processor_config, *args, **kwargs)
+        self._init_extras(vocab_processor_config)
+        self.config = vocab_processor_config
+        self._already_downloaded = False
+        self._args = args
+        self._kwargs = kwargs
 
     def __call__(self, item):
+        if not self._already_downloaded:
+            self.vocab = Vocab(*self._args, **self.config.vocab, **self._kwargs)
+            self._already_downloaded = True
+
         indices = super().__call__(item)["text"]
         embeddings = torch.zeros(
             (len(indices), self.vocab.get_embedding_dim()), dtype=torch.float
@@ -454,9 +467,8 @@ class FastTextProcessor(VocabProcessor):
             return model_file_path
 
         import requests
-        from tqdm import tqdm
-
         from mmf.common.constants import FASTTEXT_WIKI_URL
+        from tqdm import tqdm
 
         PathManager.mkdirs(os.path.dirname(model_file_path))
         response = requests.get(FASTTEXT_WIKI_URL, stream=True)
@@ -618,6 +630,232 @@ class VQAAnswerProcessor(BaseProcessor):
             answers_indices[idx] = self.answer_vocab.word2idx(token)
 
         answers_scores = self.compute_answers_scores(answers_indices)
+
+        return {
+            "answers": tokens,
+            "answers_indices": answers_indices,
+            "answers_scores": answers_scores,
+        }
+
+    def get_vocab_size(self):
+        """Get vocab size of the answer vocabulary. Can also include
+        soft copy dynamic answer space size.
+
+        Returns:
+            int: size of the answer vocabulary
+
+        """
+        return self.answer_vocab.num_vocab
+
+    def get_true_vocab_size(self):
+        """True vocab size can be different from normal vocab size in some cases
+        such as soft copy where dynamic answer space is added.
+
+        Returns:
+            int: True vocab size.
+
+        """
+        return self.answer_vocab.num_vocab
+
+    def word2idx(self, word):
+        """Convert a word to its index according to vocabulary
+
+        Args:
+            word (str): Word to be converted to index.
+
+        Returns:
+            int: Index of the word.
+
+        """
+        return self.answer_vocab.word2idx(word)
+
+    def idx2word(self, idx):
+        """Index to word according to the vocabulary.
+
+        Args:
+            idx (int): Index to be converted to the word.
+
+        Returns:
+            str: Word corresponding to the index.
+
+        """
+        return self.answer_vocab.idx2word(idx)
+
+    def compute_answers_scores(self, answers_indices):
+        """Generate VQA based answer scores for answers_indices.
+
+        Args:
+            answers_indices (torch.LongTensor): tensor containing indices of the answers
+
+        Returns:
+            torch.FloatTensor: tensor containing scores.
+
+        """
+        scores = torch.zeros(self.get_vocab_size(), dtype=torch.float)
+        gt_answers = list(enumerate(answers_indices))
+        unique_answers = set(answers_indices.tolist())
+
+        for answer in unique_answers:
+            accs = []
+            for gt_answer in gt_answers:
+                other_answers = [item for item in gt_answers if item != gt_answer]
+
+                matching_answers = [item for item in other_answers if item[1] == answer]
+                acc = min(1, float(len(matching_answers)) / 3)
+                accs.append(acc)
+            avg_acc = sum(accs) / len(accs)
+
+            if answer != self.answer_vocab.UNK_INDEX:
+                scores[answer] = avg_acc
+
+        return scores
+
+    def _increase_to_ten(self, tokens):
+        while len(tokens) < self.DEFAULT_NUM_ANSWERS:
+            tokens += tokens[: self.DEFAULT_NUM_ANSWERS - len(tokens)]
+
+        return tokens
+
+
+@registry.register_processor("graph_vqa_answer")
+class GraphVQAAnswerProcessor(BaseProcessor):
+    """Processor for generating answer scores for answers passed using VQA
+    accuracy formula. Using VocabDict class to represent answer vocabulary,
+    so parameters must specify "vocab_file". "num_answers" in parameter config
+    specify the max number of answers possible. Takes in dict containing
+    "answers" or "answers_tokens". "answers" are preprocessed to generate
+    "answers_tokens" if passed.
+
+    This version also takes a graph vocab and predicts a main and graph stream simultanously
+
+    Args:
+        config (DictConfig): Configuration for the processor
+
+    Attributes:
+        answer_vocab (VocabDict): Class representing answer vocabulary
+    """
+
+    DEFAULT_NUM_ANSWERS = 10
+
+    def __init__(self, config, *args, **kwargs):
+        if not hasattr(config, "vocab_file"):
+            raise AttributeError(
+                "'vocab_file' argument required, but not "
+                "present in AnswerProcessor's config"
+            )
+
+        self.answer_vocab = VocabDict(config.vocab_file, *args, **kwargs)
+        self.PAD_IDX = self.answer_vocab.word2idx("<pad>")
+        self.BOS_IDX = self.answer_vocab.word2idx("<s>")
+        self.EOS_IDX = self.answer_vocab.word2idx("</s>")
+        self.UNK_IDX = self.answer_vocab.UNK_INDEX
+
+        # Set EOS to something not achievable if it is not there
+        if self.EOS_IDX == self.UNK_IDX:
+            self.EOS_IDX = len(self.answer_vocab)
+
+        self.preprocessor = None
+
+        if hasattr(config, "preprocessor"):
+            self.preprocessor = Processor(config.preprocessor)
+
+            if self.preprocessor is None:
+                raise ValueError(
+                    f"No processor named {config.preprocessor} is defined."
+                )
+
+        if hasattr(config, "num_answers"):
+            self.num_answers = config.num_answers
+        else:
+            self.num_answers = self.DEFAULT_NUM_ANSWERS
+            warnings.warn(
+                "'num_answers' not defined in the config. "
+                "Setting to default of {}".format(self.DEFAULT_NUM_ANSWERS)
+            )
+
+        # Load the graph answer vocab file
+        if os.path.exists(config.graph_vocab_file):
+            graph_vocab_file = config.graph_vocab_file
+        else:
+            graph_vocab_file = os.path.join(
+                os.getenv("MMF_DATA_DIR"), "datasets", config.graph_vocab_file
+            )
+        self.graph_vocab = sorted(list(torch.load(graph_vocab_file)))
+        self.ans2graphvocabidx = {}
+        for graphvocabidx, graph_ans in enumerate(self.graph_vocab):
+            # Right now, this does need to overlap with the regular vocab
+            self.ans2graphvocabidx[graph_ans] = graphvocabidx
+
+            # Make sure graph_ans actually in vocab
+            assert graph_ans in self.answer_vocab.word2idx_dict
+
+        self.config = config
+
+    def __call__(self, item):
+        """Takes in dict with answers or answers_tokens, and returns back
+        a dict with answers (processed), "answers_indices" which point to
+        indices of the answers if present and "answers_scores" which represent
+        VQA style scores for the answers.
+
+        Args:
+            item (Dict): Dict containing answers or answers_tokens
+
+        Returns:
+            Dict: Processed answers, indices and scores.
+
+        """
+        tokens = []
+
+        if not isinstance(item, dict):
+            raise TypeError("'item' passed to processor must be a dict")
+
+        if "answer_tokens" in item:
+            tokens = item["answer_tokens"]
+        elif "answers" in item and item["answers"] is not None:
+            if self.preprocessor is None:
+                raise AssertionError(
+                    "'preprocessor' must be defined if you "
+                    "don't pass 'answer_tokens'"
+                )
+
+            tokens = [
+                self.preprocessor({"text": answer})["text"]
+                for answer in item["answers"]
+            ]
+        else:
+            raise AssertionError(
+                "'answers' or 'answer_tokens' must be passed"
+                " to answer processor in a dict"
+            )
+
+        if len(tokens) != 0:
+            tokens = self._increase_to_ten(tokens)
+
+        answers_indices = torch.zeros(self.DEFAULT_NUM_ANSWERS, dtype=torch.long)
+        answers_indices.fill_(self.answer_vocab.get_unk_index())
+
+        for idx, token in enumerate(tokens):
+            answers_indices[idx] = self.answer_vocab.word2idx(token)
+
+        answers_scores = self.compute_answers_scores(answers_indices)
+
+        # Get answer scores for the graph vocab
+        if self.config.concat_scores:
+            answers_scores_graph = torch.zeros(len(self.graph_vocab), dtype=torch.float)
+            unique_answers = set(answers_indices.tolist())
+            for answer in unique_answers:
+                # Get the original score
+                if answer != self.answer_vocab.UNK_INDEX:
+                    score = answers_scores[answer]
+
+                    # Copy into graph scores (if it's in there)
+                    ans_str = self.answer_vocab.idx2word(answer)
+                    if ans_str in self.ans2graphvocabidx:
+                        graph_idx = self.ans2graphvocabidx[ans_str]
+                        answers_scores_graph[graph_idx] = score
+
+            # Concat scores
+            answers_scores = torch.cat([answers_scores, answers_scores_graph], dim=0)
 
         return {
             "answers": tokens,
@@ -1442,7 +1680,7 @@ class TransformerBboxProcessor(BaseProcessor):
         image_w = item[self.image_width_key]
         image_h = item[self.image_height_key]
         image_location = torch.zeros((bbox.shape[0], 5), dtype=torch.float)
-        image_location[:, :4] = torch.from_numpy(bbox)
+        image_location[:, :4] = torch.from_numpy(bbox[:, :4])
         image_location[:, 4] = (
             (image_location[:, 3] - image_location[:, 1])
             * (image_location[:, 2] - image_location[:, 0])
@@ -1454,3 +1692,86 @@ class TransformerBboxProcessor(BaseProcessor):
         image_location[:, 3] = image_location[:, 3] / image_h
         item["bbox"] = image_location
         return item
+
+
+@dataclass
+class MultiClassFromFileConfig:
+    # Vocab file containing the strings for the available classes
+    vocab_file: str
+
+
+@registry.register_processor("multi_class_from_file")
+class MultiClassFromFile(BaseProcessor):
+    """Label processor for multi class cases where the labels are
+    saved in a file.
+    """
+
+    def __init__(self, config: MultiClassFromFileConfig, *args, **kwargs):
+        self.label_vocab = VocabDict(config.vocab_file, *args, **kwargs)
+
+    def __call__(self, item: Union[Dict[str, Any], str]) -> Dict[str, Any]:
+        if isinstance(item, collections.abc.Mapping):
+            label = item["label"]
+        else:
+            label = item
+
+        # Remove UNK by subtracting 1 from output
+        # UNK will always be at 0 even if it is not in vocab as it is automatically
+        # always added by vocab dict
+        class_index = self.label_vocab.word2idx(label) - 1
+        assert class_index != -1, f"{label} is not present in vocab file"
+
+        return {"class_index": torch.tensor(class_index, dtype=torch.long)}
+
+
+@registry.register_processor("detr_image_and_target")
+class DETRImageAndTargetProcessor(BaseProcessor):
+    """Process a detection image and target in consistent with DETR. At training time,
+    random crop is done. At test time, an image is deterministically resized with short
+    side equal to `image_size` (while ensuring its long side no larger than `max_size`)
+    """
+
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+
+        from mmf.datasets.processors import detection_transforms as T
+
+        train_image_sizes = list(config.train_image_sizes)
+        self.training_transform = T.Compose(
+            [
+                T.RandomHorizontalFlip(),
+                T.RandomSelect(
+                    T.RandomResize(train_image_sizes, max_size=config.max_size),
+                    T.Compose(
+                        [
+                            T.RandomResize(list(config.train_resize_random_sizes)),
+                            T.RandomSizeCrop(*config.train_crop_size),
+                            T.RandomResize(train_image_sizes, max_size=config.max_size),
+                        ]
+                    ),
+                ),
+                T.ToTensor(),
+                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        self.inference_transform = T.Compose(
+            [
+                T.RandomResize([config.test_image_size], max_size=config.max_size),
+                T.ToTensor(),
+                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+
+    def __call__(self, item):
+        dataset_type = item["dataset_type"]
+        img = item["img"]
+        target = item["target"]
+
+        if dataset_type == "train":
+            img, target = self.training_transform(img, target)
+        elif dataset_type == "val" or dataset_type == "test":
+            img, target = self.inference_transform(img, target)
+        else:
+            raise Exception(f"unknown dataset_type: {dataset_type}")
+
+        return {"img": img, "target": target}

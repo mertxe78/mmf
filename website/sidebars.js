@@ -7,6 +7,8 @@
  * @format
  */
 
+const {fbInternalOnly} = require('internaldocs-fb-helpers');
+
 module.exports = {
   docs: {
     'Getting started': [
@@ -19,6 +21,7 @@ module.exports = {
     Notes: [
       'notes/concepts',
       'notes/configuration',
+      'notes/training_tricks',
       'notes/dataset_zoo',
       'notes/model_zoo',
       'notes/pretrained_models',
@@ -26,19 +29,20 @@ module.exports = {
     ],
     Tutorials: [
       'tutorials/dataset',
-      'tutorials/concat_bert',
+      'tutorials/concat_bert_tutorial',
+      'tutorials/image_feature_extraction',
       'tutorials/checkpointing',
       'tutorials/processors',
       'tutorials/slurm',
     ],
+    ...fbInternalOnly({
+      'FB Internal': ['fb/devserver', 'fb/fblearner'],
+    }),
     Challenges: [
       'challenges/hateful_memes_challenge',
       'challenges/textvqa_challenge',
       'challenges/vqa_challenge',
     ],
-    Projects: [
-      'projects/m4c',
-      'projects/movie_mcan',
-    ],
+    Projects: ['projects/butd', 'projects/m4c', 'projects/m4c_captioner', 'projects/movie_mcan', 'projects/unit'],
   },
 };

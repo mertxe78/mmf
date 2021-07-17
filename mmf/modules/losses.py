@@ -27,13 +27,25 @@ in the following way:
 """
 import collections
 import warnings
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mmf.common.registry import registry
+from mmf.utils.distributed import gather_tensor_along_batch_with_backward, get_rank
+from mmf.utils.logger import log_class_usage
+from omegaconf import MISSING
+from packaging import version
+from torch import Tensor
 from torch.nn.utils.rnn import pack_padded_sequence
 
-from mmf.common.registry import registry
+
+@dataclass
+class LossConfig:
+    type: str = MISSING
+    params: Dict[str, Any] = MISSING
 
 
 class Losses(nn.Module):
@@ -61,18 +73,26 @@ class Losses(nn.Module):
         mostly doesn't need to use this class.
 
     Attributes:
-        losses: List containing instanttions of each loss
+        losses: List containing instantiations of each loss
                                    passed in config
     """
 
-    def __init__(self, loss_list):
+    # TODO: Union types are not supported in OmegaConf.
+    # Later investigate for a workaround.for
+    def __init__(self, loss_list: List[Union[str, LossConfig]]):
         super().__init__()
-        self.losses = []
-        self._evaluation_predict = registry.get("config").evaluation.predict
+        self.losses = nn.ModuleList()
+        config = registry.get("config")
+        self._evaluation_predict = False
+        if config:
+            self._evaluation_predict = config.get("evaluation", {}).get(
+                "predict", False
+            )
+
         for loss in loss_list:
             self.losses.append(MMFLoss(loss))
 
-    def forward(self, sample_list, model_output, *args, **kwargs):
+    def forward(self, sample_list: Dict[str, Tensor], model_output: Dict[str, Tensor]):
         """Takes in the original ``SampleList`` returned from DataLoader
         and `model_output` returned from the model and returned a Dict containing
         loss for each of the losses in `losses`.
@@ -86,7 +106,7 @@ class Losses(nn.Module):
 
         """
         output = {}
-        if not hasattr(sample_list, "targets"):
+        if "targets" not in sample_list:
             if not self._evaluation_predict:
                 warnings.warn(
                     "Sample list has not field 'targets', are you "
@@ -96,13 +116,14 @@ class Losses(nn.Module):
             return output
 
         for loss in self.losses:
-            output.update(loss(sample_list, model_output, *args, **kwargs))
+            output.update(loss(sample_list, model_output))
 
-        registry_loss_key = "{}.{}.{}".format(
-            "losses", sample_list.dataset_name, sample_list.dataset_type
-        )
-        # Register the losses to registry
-        registry.register(registry_loss_key, output)
+        if not torch.jit.is_scripting():
+            registry_loss_key = "{}.{}.{}".format(
+                "losses", sample_list["dataset_name"], sample_list["dataset_type"]
+            )
+            # Register the losses to registry
+            registry.register(registry_loss_key, output)
 
         return output
 
@@ -150,10 +171,12 @@ class MMFLoss(nn.Module):
 
         loss_class = registry.get_loss_class(loss_name)
 
+        log_class_usage("Loss", loss_class)
+
         if loss_class is None:
             raise ValueError(f"No loss named {loss_name} is registered to registry")
         # Special case of multi as it requires an array
-        if loss_name == "multi":
+        if loss_name.startswith("multi"):
             assert is_mapping
             self.loss_criterion = loss_class(params)
         else:
@@ -163,8 +186,8 @@ class MMFLoss(nn.Module):
                 loss_params = {}
             self.loss_criterion = loss_class(**loss_params)
 
-    def forward(self, sample_list, model_output, *args, **kwargs):
-        loss = self.loss_criterion(sample_list, model_output, *args, **kwargs)
+    def forward(self, sample_list: Dict[str, Tensor], model_output: Dict[str, Tensor]):
+        loss = self.loss_criterion(sample_list, model_output)
 
         if not isinstance(loss, torch.Tensor):
             loss = torch.tensor(loss, dtype=torch.float)
@@ -172,10 +195,12 @@ class MMFLoss(nn.Module):
         if loss.dim() == 0:
             loss = loss.view(1)
 
-        key = "{}/{}/{}".format(
-            sample_list.dataset_type, sample_list.dataset_name, self.name
-        )
-
+        if not torch.jit.is_scripting():
+            key = "{}/{}/{}".format(
+                sample_list.dataset_type, sample_list.dataset_name, self.name
+            )
+        else:
+            key = f"{self.name}"
         return {key: loss}
 
 
@@ -296,7 +321,7 @@ class CaptionCrossEntropyLoss(nn.Module):
             decode_lengths = (caption_lengths - 1).tolist()
         else:
             decode_lengths = [targets.size(1)] * targets.size(0)
-        if torch.__version__ >= "1.1":
+        if version.parse(torch.__version__) >= version.parse("1.1"):
             scores = pack_padded_sequence(scores, decode_lengths, batch_first=True).data
             targets = pack_padded_sequence(
                 targets, decode_lengths, batch_first=True
@@ -312,8 +337,7 @@ class CaptionCrossEntropyLoss(nn.Module):
 
 @registry.register_loss("nll_loss")
 class NLLLoss(nn.Module):
-    """Negative log likelikehood loss.
-    """
+    """Negative log likelikehood loss."""
 
     def __init__(self):
         super().__init__()
@@ -400,7 +424,7 @@ class MultiLoss(nn.Module):
         loss = 0
         for idx, loss_fn in enumerate(self.losses):
             value = loss_fn(sample_list, model_output, *args, **kwargs)
-            loss += self.losses_weights[idx] * value
+            loss += self.losses_weights[idx] * list(value.values())[0]
         return loss
 
 
@@ -552,11 +576,244 @@ class M4CDecodingBCEWithMaskLoss(nn.Module):
 
 @registry.register_loss("cross_entropy")
 class CrossEntropyLoss(nn.Module):
-    def __init__(self, params=None):
+    def __init__(self, **params):
         super().__init__()
-        if params is None:
-            params = {}
         self.loss_fn = nn.CrossEntropyLoss(**params)
 
     def forward(self, sample_list, model_output):
-        return self.loss_fn(model_output["scores"], sample_list.targets)
+        return self.loss_fn(model_output["scores"], sample_list["targets"])
+
+
+@registry.register_loss("soft_label_cross_entropy")
+class SoftLabelCrossEntropyLoss(nn.Module):
+    def __init__(self, ignore_index=-100, reduction="mean", normalize_targets=True):
+        assert reduction in (
+            "mean",
+            "sum",
+        ), "Argument `reduction` only supports `mean` and `sum`"
+
+        super().__init__()
+
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+        self.normalize_targets = normalize_targets
+        self.eps = torch.finfo(torch.float32).eps
+
+    @staticmethod
+    def convert_to_one_hot(targets, n_classes):
+        one_hot_targets = torch.zeros(
+            (targets.size(0), n_classes), dtype=torch.long, device=targets.device
+        )
+        one_hot_targets.scatter_(1, targets.long().view(-1, 1), 1)
+        return one_hot_targets
+
+    def compute_loss(self, targets, scores):
+        """for N examples and C classes
+        - scores: N x C these are raw outputs (without softmax/sigmoid)
+        - targets: N x C or N corresponding targets
+
+        Target elements set to ignore_index contribute 0 loss.
+
+        Samples where all entries are ignore_index do not contribute to the loss
+        reduction.
+        """
+
+        assert targets.size(0) == scores.size(
+            0
+        ), "`targets` and `scores` should have the same batch size"
+
+        if targets.dim() == 1:
+            targets = targets.unsqueeze(1)
+            mask = targets.ne(self.ignore_index).float()  # mask out `ignore_index`
+        else:
+            mask = targets.sum(-1, keepdim=True).ne(0).float()  # mask out zero rows
+
+        if targets.size(1) == 1:
+            targets = self.convert_to_one_hot(targets, scores.size(1))
+        targets = targets.float() * mask
+
+        if self.normalize_targets:
+            targets /= self.eps + targets.sum(dim=1, keepdim=True)
+
+        per_sample_per_target_loss = -targets * F.log_softmax(scores, dim=-1)
+        per_sample_loss = torch.sum(per_sample_per_target_loss, -1)
+        loss = per_sample_loss.sum()
+        # perform reduction
+        if self.reduction == "mean":
+            # normalize based on the number of samples with > 0 non-ignored targets
+            loss /= torch.sum(torch.sum(mask, -1) > 0).clamp(min=1)
+        return loss
+
+    def forward(self, sample_list, model_output):
+        return self.compute_loss(sample_list["targets"], model_output["scores"])
+
+
+@registry.register_loss("label_smoothing_cross_entropy")
+class LabelSmoothingCrossEntropyLoss(SoftLabelCrossEntropyLoss):
+    """Cross-entropy loss with label smoothing. If `label_smoothing` = 0, then
+    it's canonical cross entropy.
+    The smoothed one-hot encoding is 1 - label_smoothing for true label and
+    label_smoothing / (num_classes - 1) for the rest.
+
+    Reference: https://stackoverflow.com/questions/55681502/label-smoothing-in-pytorch
+    """
+
+    def __init__(self, label_smoothing=0.1, reduction="mean", ignore_index=-100):
+        assert (
+            0 <= label_smoothing < 1
+        ), "value of argument `label_smoothing` must be in range [0, 1)."
+
+        super().__init__(ignore_index, reduction, False)
+        self.label_smoothing = label_smoothing
+
+    def smooth_targets(self, targets, n_classes):
+        if targets.dim() == 1:
+            targets = targets.unsqueeze(1)
+        mask = targets.ne(self.ignore_index)
+
+        smoothing_value = self.label_smoothing / (n_classes - 1)
+        one_hot = torch.full(
+            (n_classes,), smoothing_value, device=targets.device
+        ).repeat(targets.size(0), 1)
+        # mask out target with `ignore_index` to avoid error `index out of bounds`
+        one_hot.scatter_(1, targets * mask.long(), 1 - self.label_smoothing)
+        return one_hot * mask.float()
+
+    def forward(self, sample_list, model_output):
+        scores = model_output["scores"]
+        one_hot = self.smooth_targets(sample_list["targets"], scores.size(1))
+        loss = self.compute_loss(one_hot, scores)
+        return loss
+
+
+@registry.register_loss("in_batch_hinge")
+class InBatchHinge(nn.Module):
+    """
+    Based on the code from https://github.com/fartashf/vsepp/blob/master/model.py
+    """
+
+    def __init__(self, margin: float = 0.0, hard: bool = False):
+        super().__init__()
+        self.margin = margin
+        self.hard = hard
+
+    def _compute_loss(self, correlations: Tensor):
+        diagonal = correlations.diag()[:, None]
+        d1 = diagonal.expand_as(correlations)
+        d2 = diagonal.t().expand_as(correlations)
+
+        # compare every diagonal score to scores in its column
+        # caption retrieval
+        cost_s = (self.margin + correlations - d1).clamp(min=0)
+        # compare every diagonal score to scores in its row
+        # image retrieval
+        cost_im = (self.margin + correlations - d2).clamp(min=0)
+
+        # clear diagonals
+        mask = 1 - torch.eye(correlations.size(0), device=correlations.device)
+        cost_s = cost_s * mask
+        cost_im = cost_im * mask
+
+        if self.hard:
+            cost_s = cost_s.max(1)[0]
+            cost_im = cost_im.max(0)[0]
+
+        return cost_s.sum() + cost_im.sum()
+
+    def forward(self, sample_list: Dict[str, Tensor], model_output: Dict[str, Tensor]):
+        image_embeddings = model_output["scores"]
+        text_embeddings = model_output["targets"]
+
+        if image_embeddings.shape[0] == text_embeddings.shape[0]:
+            # Training/Single-GT loss
+            correlations = image_embeddings @ text_embeddings.t()
+            loss = self._compute_loss(correlations)
+        else:
+            # Evaluation/Multi-GT loss
+            assert text_embeddings.shape[0] % image_embeddings.shape[0] == 0
+
+            batch_size, dim_size = image_embeddings.shape
+            factor = text_embeddings.shape[0] // image_embeddings.shape[0]
+            text_embeddings = text_embeddings.reshape(batch_size, factor, dim_size)
+            correlations = image_embeddings @ text_embeddings.permute(1, 2, 0)  # FxBxB
+
+            loss = 0
+            for corr in correlations:
+                loss += self._compute_loss(corr)
+
+        return loss
+
+
+@registry.register_loss("contrastive_loss")
+class ContrastiveLoss(nn.Module):
+    """
+    This is a generic contrastive loss typically used for pretraining. No modality
+    assumptions are made here.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, sample_list: Dict[str, Tensor], model_output: Dict[str, Tensor]):
+        assert (
+            "embedding_1" in model_output and "embedding_2" in model_output
+        ), "Embedding names must be available before loss calculation"
+
+        embedding_1 = model_output["embedding_1"]
+        embedding_2 = model_output["embedding_2"]
+
+        assert embedding_1.size(0) == embedding_2.size(0), "batch size must match"
+        per_gpu_batch_size = embedding_1.size(0)
+
+        embedding_1_all_gpus = gather_tensor_along_batch_with_backward(embedding_1)
+        embedding_2_all_gpus = gather_tensor_along_batch_with_backward(embedding_2)
+
+        temperature = model_output["temperature"]
+
+        logits_1 = (
+            torch.matmul(embedding_1, embedding_2_all_gpus.transpose(0, 1))
+            / temperature
+        )
+        logits_2 = (
+            torch.matmul(embedding_2, embedding_1_all_gpus.transpose(0, 1))
+            / temperature
+        )
+        labels = per_gpu_batch_size * get_rank() + torch.arange(
+            per_gpu_batch_size, device=temperature.device
+        )
+
+        loss_1 = F.cross_entropy(logits_1, labels)
+        loss_2 = F.cross_entropy(logits_2, labels)
+
+        return (loss_1 + loss_2) / 2
+
+
+@registry.register_loss("mse")
+class MSELoss(nn.Module):
+    """Mean Squared Error loss"""
+
+    def __init__(self):
+        super().__init__()
+        self.loss_fn = nn.MSELoss()
+
+    def forward(self, sample_list, model_output):
+        targets = sample_list["targets"]
+        scores = model_output["scores"]
+        loss = self.loss_fn(scores, targets)
+        return loss
+
+
+@registry.register_loss("cos_emb_loss")
+class CosineEmbeddingLoss(nn.Module):
+    """Cosine embedding loss"""
+
+    def __init__(self):
+        super().__init__()
+        self.loss_fn = nn.CosineEmbeddingLoss()
+
+    def forward(self, sample_list, model_output):
+        targets = sample_list["targets"]
+        scores = model_output["scores"]
+        y = torch.ones(targets.size(0)).to(targets.device)
+        loss = self.loss_fn(scores, targets, y)
+        return loss

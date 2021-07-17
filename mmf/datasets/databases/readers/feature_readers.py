@@ -1,12 +1,28 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+
+import math
 import os
 import pickle
+from typing import Any
 
 import lmdb
 import numpy as np
 import torch
-
 from mmf.utils.file_io import PathManager
+
+
+def load_feat(feat_path: str, convert_to_tensor: bool = False) -> Any:
+    with PathManager.open(feat_path, "rb") as f:
+        if feat_path.endswith("npy"):
+            feat = np.load(f, allow_pickle=True)
+            if convert_to_tensor:
+                feat = torch.from_numpy(feat)
+        elif feat_path.endswith("pth"):
+            feat = torch.load(f, map_location=torch.device("cpu"))
+        else:
+            raise AssertionError("Unknown feature type")
+
+    return feat
 
 
 class FeatureReader:
@@ -57,7 +73,7 @@ class FeatureReader:
         elif self.ndim == 3 and not self.depth_first:
             self.feat_reader = Dim3FeatureReader()
         elif self.ndim == 4 and self.depth_first:
-            self.feat_reader = CHWFeatureReader()
+            self.feat_reader = CHWFeatureReader(self.max_features)
         elif self.ndim == 4 and not self.depth_first:
             self.feat_reader = HWCFeatureReader()
         else:
@@ -72,10 +88,7 @@ class FeatureReader:
             # Currently all lmdb features are with ndim == 2 so we are
             # avoiding loading the lmdb to determine feature ndim
             if not self.base_path.endswith(".lmdb") and self.ndim is None:
-                if image_feat_path.endswith("npy"):
-                    feat = np.load(image_feat_path)
-                elif image_feat_path.endswith("pth"):
-                    feat = torch.load(image_feat_path, map_location=torch.device("cpu"))
+                feat = load_feat(image_feat_path)
                 self.ndim = feat.ndim
             self._init_reader()
 
@@ -84,23 +97,33 @@ class FeatureReader:
 
 class FasterRCNNFeatureReader:
     def read(self, image_feat_path):
-        return torch.from_numpy(np.load(image_feat_path)), None
+        feat = load_feat(image_feat_path, convert_to_tensor=True)
+        return feat, None
 
 
 class CHWFeatureReader:
+    def __init__(self, max_features=None):
+        self.max_features = max_features
+        if self.max_features:
+            patch_dim = math.ceil(math.sqrt(self.max_features))
+            self.img_h = patch_dim
+            self.img_w = patch_dim
+
     def read(self, image_feat_path):
-        if image_feat_path.endswith("npy"):
-            feat = torch.from_numpy(np.load(image_feat_path))
-        elif image_feat_path.endswith("pth"):
-            feat = torch.load(image_feat_path, map_location=torch.device("cpu"))
+        feat = load_feat(image_feat_path, convert_to_tensor=True)
         assert feat.shape[0] == 1, "batch is not 1"
+        b, c, h, w = feat.shape
+        if self.max_features:
+            padded_feat = torch.zeros((b, c, self.img_h, self.img_w), dtype=torch.float)
+            padded_feat[:, :, :h, :w] = feat
+            feat = padded_feat
         feat = feat.squeeze(0)
         return feat, None
 
 
 class Dim3FeatureReader:
     def read(self, image_feat_path):
-        tmp = np.load(image_feat_path)
+        tmp = load_feat(image_feat_path)
         _, _, c_dim = tmp.shape
         image_feature = torch.from_numpy(np.reshape(tmp, (-1, c_dim)))
         return image_feature, None
@@ -108,7 +131,7 @@ class Dim3FeatureReader:
 
 class HWCFeatureReader:
     def read(self, image_feat_path):
-        tmp = np.load(image_feat_path)
+        tmp = load_feat(image_feat_path)
         assert tmp.shape[0] == 1, "batch is not 1"
         _, _, _, c_dim = tmp.shape
         image_feature = torch.from_numpy(np.reshape(tmp, (-1, c_dim)))
@@ -123,11 +146,11 @@ class PaddedFasterRCNNFeatureReader:
 
     def _load(self, image_feat_path):
         image_info = {}
-        image_info["features"] = np.load(image_feat_path, allow_pickle=True)
+        image_info["features"] = load_feat(image_feat_path)
 
         info_path = "{}_info.npy".format(image_feat_path.split(".npy")[0])
         if PathManager.exists(info_path):
-            image_info.update(np.load(info_path, allow_pickle=True).item())
+            image_info.update(load_feat(info_path).item())
 
         return image_info
 
@@ -154,6 +177,28 @@ class PaddedFasterRCNNFeatureReader:
                 if "image_text" in item["info"]:
                     image_info.update(item["info"])
                 image_feature = item["feature"]
+
+        # Handle case of features with class probs
+        if (
+            image_info["features"].size == 1
+            and "features" in image_info["features"].item()
+        ):
+            item = image_info["features"].item()
+            image_feature = item["features"]
+            image_info["image_height"] = item["image_height"]
+            image_info["image_width"] = item["image_width"]
+
+            # Resize these to self.max_loc
+            image_loc, _ = image_feature.shape
+            image_info["cls_prob"] = np.zeros(
+                (self.max_loc, item["cls_prob"].shape[1]), dtype=np.float32
+            )
+            image_info["cls_prob"][0:image_loc,] = item["cls_prob"][: self.max_loc, :]
+            image_info["bbox"] = np.zeros(
+                (self.max_loc, item["bbox"].shape[1]), dtype=np.float32
+            )
+            image_info["bbox"][0:image_loc,] = item["bbox"][: self.max_loc, :]
+            image_info["num_boxes"] = item["num_boxes"]
 
         # Handle the case of ResNet152 features
         if len(image_feature.shape) > 2:
@@ -225,7 +270,7 @@ class PaddedFeatureRCNNWithBBoxesFeatureReader:
         self.max_loc = max_loc
 
     def read(self, image_feat_path):
-        image_feat_bbox = np.load(image_feat_path)
+        image_feat_bbox = load_feat(image_feat_path)
         image_boxes = image_feat_bbox.item().get("image_bboxes")
         tmp_image_feat = image_feat_bbox.item().get("image_feature")
         image_loc, image_dim = tmp_image_feat.shape

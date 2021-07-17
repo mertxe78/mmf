@@ -1,15 +1,16 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 
 import argparse
+import os
 import unittest
 from copy import deepcopy
 
 import torch
-from omegaconf import OmegaConf
-
 from mmf.common.registry import registry
 from mmf.models.base_model import BaseModel
 from mmf.trainers.callbacks.lr_scheduler import LRSchedulerCallback
+from mmf.utils.configuration import load_yaml
+from omegaconf import OmegaConf
 
 
 class SimpleModule(BaseModel):
@@ -44,7 +45,9 @@ class NumbersDataset(torch.utils.data.Dataset):
 class TestLogisticsCallback(unittest.TestCase):
     def setUp(self):
         self.trainer = argparse.Namespace()
-        self.config = OmegaConf.create(
+        self.config = load_yaml(os.path.join("configs", "defaults.yaml"))
+        self.config = OmegaConf.merge(
+            self.config,
             {
                 "model": "simple",
                 "model_config": {},
@@ -54,14 +57,16 @@ class TestLogisticsCallback(unittest.TestCase):
                     "lr_steps": [1, 2],
                     "use_warmup": False,
                 },
-            }
+            },
         )
         # Keep original copy for testing purposes
         self.trainer.config = deepcopy(self.config)
         registry.register("config", self.trainer.config)
 
         self.trainer.model = SimpleModule()
-        self.trainer.val_dataset = NumbersDataset()
+        self.trainer.val_loader = torch.utils.data.DataLoader(
+            NumbersDataset(), batch_size=self.config.training.batch_size
+        )
 
         self.trainer.optimizer = torch.optim.Adam(
             self.trainer.model.parameters(), lr=1e-01
@@ -73,9 +78,9 @@ class TestLogisticsCallback(unittest.TestCase):
     def tearDown(self):
         registry.unregister("config")
 
-    def test_on_batch_end(self):
-        self.trainer.lr_scheduler_callback.on_batch_end()
+    def test_on_update_end(self):
+        self.trainer.lr_scheduler_callback.on_update_end()
         self.assertAlmostEqual(self.trainer.optimizer.param_groups[0]["lr"], 1e-02)
 
-        self.trainer.lr_scheduler_callback.on_batch_end()
+        self.trainer.lr_scheduler_callback.on_update_end()
         self.assertAlmostEqual(self.trainer.optimizer.param_groups[0]["lr"], 1e-03)

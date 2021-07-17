@@ -1,9 +1,9 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 
+import collections
 from copy import deepcopy
 
 import torch
-
 from mmf.common.registry import registry
 from mmf.models.base_model import BaseModel
 from mmf.modules.encoders import MultiModalEncoderBase
@@ -30,7 +30,7 @@ class UnimodalBase(MultiModalEncoderBase):
     def forward(self, x, *args, **kwargs):
         x = self.encoder(x, *args, **kwargs)
         # Case of bert encoder, we only need pooled output
-        if len(x) == 2:
+        if isinstance(x, collections.abc.Sequence) and len(x) >= 2:
             x = x[1]
 
         x = torch.flatten(x, start_dim=1)
@@ -83,6 +83,10 @@ class UnimodalModal(BaseModel):
     def build(self):
         self.base = UnimodalBase(self.config)
         self._is_direct_features_input = self.config.direct_features_input
+        if self.config.get("freeze_base", False):
+            for param in self.base.parameters():
+                param.requires_grad = False
+
         num_features = self.config.modal_encoder.params.num_output_features
 
         # As the in_dim is dynamically calculated we need to copy classifier_config

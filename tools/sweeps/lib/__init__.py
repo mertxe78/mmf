@@ -7,7 +7,8 @@ import os
 import socket
 
 
-def get_args():
+# if argv is None, we will read from sys.argv (invoke params)
+def get_args(argv=None):
     parser = argparse.ArgumentParser("Script for launching hyperparameter sweeps")
     parser.add_argument(
         "-p",
@@ -31,6 +32,21 @@ def get_args():
         type=int,
         default=1,
         help="number of nodes for distributed training",
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="aicommerce__multimodal_model",
+        help="registered model type",
+    )
+    parser.add_argument(
+        "--oncall", type=str, default="ai_commerce", help="oncall team "
+    )
+    parser.add_argument(
+        "--capabilities",
+        type=str,
+        default="GPU_V100_HOST",
+        help="hardware capabilities",
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
@@ -75,7 +91,7 @@ def get_args():
     else:
         default_backend = "fblearner"
         parser.add_argument(
-            "--checkpoints-dir",
+            "--checkpoints_dir",
             default=os.path.join(
                 "/mnt/vol/gfsai-east/ai-group/users",
                 os.environ["USER"],
@@ -84,6 +100,14 @@ def get_args():
             ),
             help="save checkpoints and logs in "
             + "<checkpoints-dir>/<prefix>.<save_dir_key>",
+        )
+        parser.add_argument(
+            "--workflow",
+            default="faim.mmf_run.train_workflow@faim",
+            help="fblearner workflow name",
+        )
+        parser.add_argument(
+            "--buck-target", default=None, help="fblearner buck-target if required"
         )
 
     parser.add_argument(
@@ -98,11 +122,6 @@ def get_args():
         "--run-as-secure-group",
         help="secure group to use",
         default="fair_research_and_engineering",
-    )
-    parser.add_argument(
-        "--torch_home",
-        help="torch cache path",
-        default="/mnt/vol/gfsfblearner-oregon/users/vedanuj/torch/",
     )
 
     # Slurm params
@@ -159,7 +178,8 @@ def get_args():
         help="enable tensorboard logging by passing --tensorboard 1",
     )
 
-    args = parser.parse_args()
+    # Will read sys.argv if argv is None
+    args = parser.parse_args(argv)
     return args
 
 

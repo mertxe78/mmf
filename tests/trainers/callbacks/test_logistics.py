@@ -8,15 +8,15 @@ from copy import deepcopy
 from unittest.mock import Mock
 
 import torch
-from omegaconf import OmegaConf
-
 from mmf.common.meter import Meter
 from mmf.common.registry import registry
 from mmf.common.report import Report
 from mmf.models.base_model import BaseModel
 from mmf.trainers.callbacks.logistics import LogisticsCallback
+from mmf.utils.configuration import load_yaml
 from mmf.utils.file_io import PathManager
 from mmf.utils.logger import setup_logger
+from omegaconf import OmegaConf
 
 
 class SimpleModule(BaseModel):
@@ -52,7 +52,9 @@ class TestLogisticsCallback(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.trainer = argparse.Namespace()
-        self.config = OmegaConf.create(
+        self.config = load_yaml(os.path.join("configs", "defaults.yaml"))
+        self.config = OmegaConf.merge(
+            self.config,
             {
                 "model": "simple",
                 "model_config": {},
@@ -65,19 +67,20 @@ class TestLogisticsCallback(unittest.TestCase):
                     "logger_level": "info",
                 },
                 "env": {"save_dir": self.tmpdir},
-            }
+            },
         )
         # Keep original copy for testing purposes
         self.trainer.config = deepcopy(self.config)
         registry.register("config", self.trainer.config)
-        setup_logger.cache_clear()
         setup_logger()
         self.report = Mock(spec=Report)
         self.report.dataset_name = "abcd"
         self.report.dataset_type = "test"
 
         self.trainer.model = SimpleModule()
-        self.trainer.val_dataset = NumbersDataset()
+        self.trainer.val_loader = torch.utils.data.DataLoader(
+            NumbersDataset(), batch_size=self.config.training.batch_size
+        )
 
         self.trainer.optimizer = torch.optim.Adam(
             self.trainer.model.parameters(), lr=1e-01
@@ -100,12 +103,12 @@ class TestLogisticsCallback(unittest.TestCase):
             int(self.cb.train_timer.get_time_since_start().split("ms")[0]), expected
         )
 
-    def test_on_batch_end(self):
+    def test_on_update_end(self):
         self.cb.on_train_start()
-        self.cb.on_batch_end(meter=self.trainer.meter, should_log=False)
+        self.cb.on_update_end(meter=self.trainer.meter, should_log=False)
         f = PathManager.open(os.path.join(self.tmpdir, "train.log"))
         self.assertFalse(any("time_since_start" in line for line in f.readlines()))
-        self.cb.on_batch_end(meter=self.trainer.meter, should_log=True)
+        self.cb.on_update_end(meter=self.trainer.meter, should_log=True)
         f = PathManager.open(os.path.join(self.tmpdir, "train.log"))
         self.assertTrue(any("time_since_start" in line for line in f.readlines()))
 

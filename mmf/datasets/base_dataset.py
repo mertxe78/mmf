@@ -1,8 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-from torch.utils.data.dataset import Dataset
-
 from mmf.common.registry import registry
 from mmf.common.sample import SampleList
+from mmf.utils.general import get_current_device
+from torch.utils.data.dataset import Dataset
 
 
 class BaseDataset(Dataset):
@@ -25,7 +25,7 @@ class BaseDataset(Dataset):
         self._dataset_name = dataset_name
         self._dataset_type = dataset_type
         self._global_config = registry.get("config")
-        self._device = registry.get("current_device")
+        self._device = get_current_device()
         self.use_cuda = "cuda" in str(self._device)
 
     def load_item(self, idx):
@@ -48,7 +48,7 @@ class BaseDataset(Dataset):
         raise NotImplementedError
 
     def init_processors(self):
-        if not hasattr(self.config, "processors"):
+        if "processors" not in self.config:
             return
 
         from mmf.utils.build import build_processors
@@ -65,7 +65,8 @@ class BaseDataset(Dataset):
 
     def prepare_batch(self, batch):
         """
-        Can be possibly overridden in your child class
+        Can be possibly overridden in your child class. Not supported w Lightning
+        trainer
 
         Prepare batch for passing to model. Whatever returned from here will
         be directly passed to model's forward function. Currently moves the batch to
@@ -100,6 +101,10 @@ class BaseDataset(Dataset):
     @dataset_name.setter
     def dataset_name(self, name):
         self._dataset_name = name
+
+    @dataset_type.setter
+    def dataset_type(self, dataset_type):
+        self._dataset_type = dataset_type
 
     def format_for_prediction(self, report):
         return []

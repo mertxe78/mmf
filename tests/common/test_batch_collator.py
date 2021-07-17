@@ -2,9 +2,8 @@
 
 import unittest
 
-import torch
-
 import tests.test_utils as test_utils
+import torch
 from mmf.common.batch_collator import BatchCollator
 from mmf.common.sample import Sample
 
